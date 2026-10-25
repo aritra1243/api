@@ -52,14 +52,27 @@ class RouteOptimizerView(APIView):
     and returns an interactive map + cost summary.
     """
 
+    def get(self, request):
+        """Allow testing via GET with query params (e.g. ?start=...&finish=...)."""
+        return self._process(request, request.query_params)
+
     def post(self, request):
+        """Process POST with JSON body or query parameters."""
+        data = request.data if (request.data and "start" in request.data) else request.query_params
+        return self._process(request, data)
+
+    def _process(self, request, input_data):
         t_start = time.monotonic()
 
         # ── Validate input ──────────────────────────────────────────────────
-        serializer = RouteRequestSerializer(data=request.data)
+        serializer = RouteRequestSerializer(data=input_data)
         if not serializer.is_valid():
             return Response(
-                {"error": "Invalid input", "details": serializer.errors},
+                {
+                    "error": "Invalid input",
+                    "details": serializer.errors,
+                    "tip": "In Postman, select the 'Body' tab -> 'raw' -> 'JSON' and provide: {\"start\": \"New York, NY\", \"finish\": \"Chicago, IL\"}",
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
