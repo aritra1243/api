@@ -39,10 +39,19 @@ def generate_route_map(route_data: dict, fuel_stops: list, map_id: str) -> str:
     mid_idx = len(coords) // 2
     center = coords[mid_idx]
 
+    geoapify_key = getattr(settings, "GEOAPIFY_API_KEY", "").strip()
+    if geoapify_key:
+        tiles_url = f"https://maps.geoapify.com/v1/tile/osm-bright/{{z}}/{{x}}/{{y}}.png?apiKey={geoapify_key}"
+        attribution = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, &copy; <a href="https://www.geoapify.com/">Geoapify</a>'
+    else:
+        tiles_url = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}"
+        attribution = "Tiles &copy; Esri &mdash; Source: Esri, DeLorme, NAVTEQ, USGS, Intermap, iPC, NRCAN, Esri Japan, METI, Esri China (Hong Kong), Esri (Thailand), TomTom"
+
     m = folium.Map(
         location=center,
         zoom_start=5,
-        tiles="OpenStreetMap",
+        tiles=tiles_url,
+        attr=attribution,
     )
 
     # ── Route polyline (downsample if over 2000 points for fast rendering) ─
