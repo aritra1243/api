@@ -77,8 +77,9 @@ CACHES = {
 }
 
 # App settings
-ORS_API_KEY = os.getenv('ORS_API_KEY', '')
-ROUTING_ENGINE = os.getenv('ROUTING_ENGINE', 'osrm').lower()  # 'osrm' (free, no key needed) or 'ors'
+GEOAPIFY_API_KEY = os.getenv('GEOAPIFY_API_KEY', '').strip()
+ORS_API_KEY = os.getenv('ORS_API_KEY', '').strip()
+ROUTING_ENGINE = os.getenv('ROUTING_ENGINE', 'geoapify' if GEOAPIFY_API_KEY else 'osrm').lower()
 
 # Check data/ directory first, then root directory
 _candidate_paths = [

@@ -1,19 +1,14 @@
 """
-Routing service supporting free OpenStreetMap/OSRM routing (no API key needed)
-and optional OpenRouteService (ORS) when configured.
+Routing and geocoding service supporting:
+1. Geoapify (using provided API key, 3,000 requests/day free tier)
+2. OSRM / OpenStreetMap (100% free fallback, zero key needed)
+3. OpenRouteService (optional fallback)
 
-Primary Engine:
-- OSRM (Open Source Routing Machine) public demo server
-  URL: https://router.project-osrm.org
-  - 100% free, NO API key required.
-  - Returns complete driving geometry, distance, and duration.
-- Backup Engine: OpenStreetMap routed-car
-  URL: https://routing.openstreetmap.de/routed-car
-
-Geocoding:
-- Built-in instant coordinates for top US metropolitan areas.
-- Free Nominatim OpenStreetMap geocoding for all other US cities.
-- Caching layer (LocMemCache) to avoid duplicate external requests.
+Strategy:
+- Geocodes start and finish locations (using Geoapify with Nominatim fallback)
+- Calls routing engine ONCE to retrieve the full highway geometry and distance
+- Computes cumulative distances locally
+- Caches all results in memory for maximum speed
 """
 import hashlib
 import logging
@@ -35,7 +30,7 @@ OSRM_SERVERS = [
     "https://routing.openstreetmap.de/routed-car",
 ]
 
-# ORS base URL (Optional, requires API key)
+# ORS base URL (Optional)
 ORS_BASE = "https://api.openrouteservice.org"
 
 # Instant coordinate cache for popular US cities (avoids geocode latency)
@@ -130,9 +125,7 @@ def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> floa
 
 
 def _polyline_cumulative_distances(coords: list[tuple[float, float]]) -> list[float]:
-    """
-    Given a list of (lat, lon) points, calculate cumulative mileage at each point.
-    """
+    """Given a list of (lat, lon) points, calculate cumulative mileage at each point."""
     distances = [0.0]
     for i in range(1, len(coords)):
         d = _haversine_miles(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1])
@@ -140,34 +133,34 @@ def _polyline_cumulative_distances(coords: list[tuple[float, float]]) -> list[fl
     return distances
 
 
-def geocode(place: str) -> tuple[float, float]:
-    """
-    Geocode a place name or coordinate string to (latitude, longitude).
-    1. Direct lat,lon parsing (e.g. '40.7128, -74.0060')
-    2. Common US cities cache (0ms)
-    3. Django cache (0ms)
-    4. Nominatim OpenStreetMap API (free, no key needed)
-    """
-    cleaned = place.strip()
+def _geocode_geoapify(place: str, api_key: str) -> tuple[float, float] | None:
+    """Geocode place using Geoapify API."""
+    url = "https://api.geoapify.com/v1/geocode/search"
+    params = {
+        "text": place,
+        "apiKey": api_key,
+        "filter": "countrycode:us",
+        "limit": 1,
+    }
+    session = _make_session(retries=2, backoff=0.5)
+    try:
+        resp = session.get(url, params=params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            features = data.get("features", [])
+            if features:
+                coords = features[0]["geometry"]["coordinates"]
+                # GeoJSON coordinates are [lon, lat]
+                return float(coords[1]), float(coords[0])
+    except Exception as e:
+        logger.warning("Geoapify geocoding error for '%s': %s", place, e)
+    return None
 
-    # 1. Check if user passed literal coordinates: "lat, lon"
-    coord_match = re.match(r"^([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)$", cleaned)
-    if coord_match:
-        lat, lon = float(coord_match.group(1)), float(coord_match.group(2))
-        return lat, lon
 
-    key_upper = cleaned.upper()
-    if key_upper in COMMON_US_CITIES:
-        return COMMON_US_CITIES[key_upper]
-
-    # Check cache
-    geo_cache_key = "geo_" + hashlib.md5(cleaned.lower().encode()).hexdigest()
-    cached = cache.get(geo_cache_key)
-    if cached:
-        return cached
-
-    # Query Nominatim
+def _geocode_nominatim(place: str) -> tuple[float, float] | None:
+    """Geocode place using Nominatim OpenStreetMap (no key)."""
     url = "https://nominatim.openstreetmap.org/search"
+    cleaned = place.strip()
     query = cleaned if "USA" in cleaned.upper() or "UNITED STATES" in cleaned.upper() else f"{cleaned}, USA"
     params = {
         "q": query,
@@ -179,39 +172,108 @@ def geocode(place: str) -> tuple[float, float]:
         "User-Agent": "FuelRouteOptimizer/2.0 (DjangoAssessment)",
         "Accept": "application/json",
     }
-
-    session = _make_session(retries=3, backoff=1.0)
+    session = _make_session(retries=2, backoff=1.0)
     try:
         resp = session.get(url, params=params, headers=headers, timeout=12)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        logger.warning("Nominatim request error for '%s': %s", cleaned, e)
-        # Try without ', USA' suffix
-        try:
-            resp = session.get(url, params={"q": cleaned, "format": "json", "limit": 1}, headers=headers, timeout=12)
+        if resp.status_code == 200:
             data = resp.json()
-        except Exception:
-            data = []
+            if data:
+                return float(data[0]["lat"]), float(data[0]["lon"])
+    except Exception as e:
+        logger.warning("Nominatim geocoding error for '%s': %s", place, e)
+    return None
 
-    if not data:
+
+def geocode(place: str) -> tuple[float, float]:
+    """
+    Geocode a place name or coordinate string to (latitude, longitude).
+    1. Direct lat,lon parsing (e.g. '40.7128, -74.0060')
+    2. Common US cities cache (0ms)
+    3. Django cache (0ms)
+    4. Geoapify (if key configured)
+    5. Nominatim OpenStreetMap (free fallback)
+    """
+    cleaned = place.strip()
+
+    # 1. Literal coordinates
+    coord_match = re.match(r"^([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)$", cleaned)
+    if coord_match:
+        return float(coord_match.group(1)), float(coord_match.group(2))
+
+    # 2. Common cities
+    key_upper = cleaned.upper()
+    if key_upper in COMMON_US_CITIES:
+        return COMMON_US_CITIES[key_upper]
+
+    # 3. Cache
+    geo_cache_key = "geo_" + hashlib.md5(cleaned.lower().encode()).hexdigest()
+    cached = cache.get(geo_cache_key)
+    if cached:
+        return cached
+
+    # 4. Geoapify
+    geoapify_key = getattr(settings, "GEOAPIFY_API_KEY", "").strip()
+    result = None
+    if geoapify_key:
+        result = _geocode_geoapify(cleaned, geoapify_key)
+
+    # 5. Nominatim fallback
+    if not result:
+        result = _geocode_nominatim(cleaned)
+
+    if not result:
         raise ValueError(
             f"Could not locate '{place}' within the USA. "
             "Please provide a valid US city name, e.g. 'Chicago, IL' or 'Austin, TX'."
         )
 
-    lat = float(data[0]["lat"])
-    lon = float(data[0]["lon"])
-    result = (lat, lon)
     cache.set(geo_cache_key, result, timeout=86400)
     return result
 
 
+def _get_route_geoapify(start_lat: float, start_lon: float, end_lat: float, end_lon: float) -> dict:
+    """Fetch driving route from Geoapify Routing API."""
+    api_key = getattr(settings, "GEOAPIFY_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("GEOAPIFY_API_KEY is not configured.")
+
+    url = "https://api.geoapify.com/v1/routing"
+    params = {
+        "waypoints": f"{start_lat},{start_lon}|{end_lat},{end_lon}",
+        "mode": "drive",
+        "apiKey": api_key,
+    }
+    session = _make_session(retries=2, backoff=1.0)
+    logger.info("Calling Geoapify Routing API: (%f, %f) -> (%f, %f)", start_lat, start_lon, end_lat, end_lon)
+    resp = session.get(url, params=params, timeout=25)
+    resp.raise_for_status()
+    data = resp.json()
+
+    feat = data["features"][0]
+    props = feat["properties"]
+    geom = feat["geometry"]
+
+    distance_miles = props["distance"] * 0.000621371  # meters to miles
+    duration_hours = props["time"] / 3600.0           # seconds to hours
+
+    # Geoapify returns LineString or MultiLineString with [lon, lat] points
+    if geom["type"] == "MultiLineString":
+        raw_coords = [c for line in geom["coordinates"] for c in line]
+    else:
+        raw_coords = geom["coordinates"]
+
+    # Convert to (lat, lon)
+    coords = [(c[1], c[0]) for c in raw_coords]
+
+    return {
+        "coords": coords,
+        "total_miles": distance_miles,
+        "duration_hours": duration_hours,
+    }
+
+
 def _get_route_osrm(start_lon: float, start_lat: float, end_lon: float, end_lat: float) -> dict:
-    """
-    Fetch route from OSRM public demo server (100% free, NO API key required).
-    Tries primary server then fallback server.
-    """
+    """Fetch route from OSRM public demo server (100% free fallback)."""
     session = _make_session(retries=3, backoff=1.0)
     last_error = None
 
@@ -230,27 +292,19 @@ def _get_route_osrm(start_lon: float, start_lat: float, end_lon: float, end_lat:
                 if data.get("code") == "Ok" and data.get("routes"):
                     route = data["routes"][0]
                     geojson_coords = route["geometry"]["coordinates"]
-                    # GeoJSON is [lon, lat] -> convert to (lat, lon)
                     coords = [(c[1], c[0]) for c in geojson_coords]
-                    total_miles = route["distance"] * 0.000621371  # meters to miles
-                    duration_hours = route["duration"] / 3600.0    # seconds to hours
+                    total_miles = route["distance"] * 0.000621371
+                    duration_hours = route["duration"] / 3600.0
                     return {
                         "coords": coords,
                         "total_miles": total_miles,
                         "duration_hours": duration_hours,
                     }
-                else:
-                    logger.warning("OSRM returned non-OK status: %s", data.get("code"))
-            else:
-                logger.warning("OSRM server %s returned status %d", base_url, resp.status_code)
         except Exception as e:
             logger.warning("OSRM server %s failed: %s", base_url, e)
             last_error = e
 
-    raise RuntimeError(
-        f"Unable to fetch driving route from OSRM servers. "
-        f"Please check network connection. Details: {last_error}"
-    )
+    raise RuntimeError(f"Unable to fetch driving route from OSRM servers: {last_error}")
 
 
 def _get_route_ors(start_lon: float, start_lat: float, end_lon: float, end_lat: float) -> dict:
@@ -290,21 +344,13 @@ def _get_route_ors(start_lon: float, start_lat: float, end_lon: float, end_lat: 
 def get_route(start: str, finish: str) -> dict:
     """
     Main entry point for routing:
-    1. Geocode start and finish locations (free, zero API key)
-    2. Check cache for route
-    3. Query free OSRM (or ORS if configured and requested)
-    4. Compute cumulative polyline mileage
-    5. Cache and return normalized route object
-
-    Returns:
-        {
-            "coords": [(lat, lon), ...],
-            "cumulative_miles": [0.0, 1.2, ...],
-            "total_miles": float,
-            "duration_hours": float,
-            "start_coords": (lat, lon),
-            "end_coords": (lat, lon),
-        }
+    1. Geocodes start and finish locations (Geoapify / Nominatim)
+    2. Checks in-memory cache for existing route
+    3. Fetches driving route:
+       - Primary: Geoapify API (using user's API key)
+       - Fallback: OSRM open routing engine
+    4. Computes cumulative polyline mileage
+    5. Caches and returns normalized route dictionary
     """
     cache_key = "route_" + hashlib.md5(f"{start}|{finish}".lower().encode()).hexdigest()
     cached = cache.get(cache_key)
@@ -316,18 +362,26 @@ def get_route(start: str, finish: str) -> dict:
     start_lat, start_lon = geocode(start)
     end_lat, end_lon = geocode(finish)
 
-    # Step 2: Route
-    engine = getattr(settings, "ROUTING_ENGINE", "osrm").lower()
+    # Step 2: Route using configured engine with automatic fallback
+    engine = getattr(settings, "ROUTING_ENGINE", "geoapify").lower()
+    geoapify_key = getattr(settings, "GEOAPIFY_API_KEY", "").strip()
     ors_key = getattr(settings, "ORS_API_KEY", "").strip()
 
-    if engine == "ors" and ors_key:
+    route_res = None
+
+    if engine == "geoapify" and geoapify_key:
+        try:
+            route_res = _get_route_geoapify(start_lat, start_lon, end_lat, end_lon)
+        except Exception as e:
+            logger.warning("Geoapify routing failed (%s), falling back to OSRM", e)
+            route_res = _get_route_osrm(start_lon, start_lat, end_lon, end_lat)
+    elif engine == "ors" and ors_key:
         try:
             route_res = _get_route_ors(start_lon, start_lat, end_lon, end_lat)
         except Exception as e:
-            logger.warning("ORS routing failed (%s), falling back to free OSRM", e)
+            logger.warning("ORS routing failed (%s), falling back to OSRM", e)
             route_res = _get_route_osrm(start_lon, start_lat, end_lon, end_lat)
     else:
-        # Default to free OSRM
         route_res = _get_route_osrm(start_lon, start_lat, end_lon, end_lat)
 
     coords = route_res["coords"]

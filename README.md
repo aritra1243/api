@@ -3,7 +3,7 @@
 A high-performance Django REST API that plans fuel-efficient driving routes across the USA, identifying optimal, cost-effective fuel stops along the route.
 
 ## Key Highlights
-- 🆓 **100% Free & Zero-Key Setup**: Uses **OSRM (Open Source Routing Machine)** and **OpenStreetMap** for routing and geocoding. No paid subscriptions, no rate limits, and no API keys required!
+- 🆓 **Free Routing API Support**: Integrates **Geoapify Routing & Geocoding API** (3,000 free requests/day) with automatic zero-downtime fallback to **OSRM (Open Source Routing Machine)**.
 - ⛽ **Optimal Fuel Stops**: Constrained by a **500-mile vehicle range**, the algorithm identifies the most cost-effective truck stops to refuel along the route corridor.
 - 💵 **Accurate Fuel Accounting**: Assumes **10 miles per gallon (MPG)**, returning exact gallons consumed and total money spent on fuel.
 - 🗺️ **Interactive Route Maps**: Automatically generates interactive route maps with Folium showing start, destination, fuel stops with pricing popups, and the driving path.
