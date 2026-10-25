@@ -1,0 +1,22 @@
+# Django
+django==6.1.2
+djangorestframework==3.18.3
+django-cors-headers==4.9.0
+
+# Routing & Geocoding
+openrouteservice==2.3.3
+requests==2.33.1
+polyline==2.0.4
+geopy==2.5.0
+
+# Geospatial
+shapely==2.2.0
+
+# Map generation
+folium==0.20.0
+
+# Data processing
+pandas>=3.0.0
+
+# Utilities
+python-dotenv==1.2.4

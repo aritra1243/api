@@ -1,0 +1,21 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Database
+db.sqlite3
+
+# Generated maps (keep directory via .gitkeep)
+maps/*.html
+!maps/.gitkeep
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
